@@ -4,6 +4,8 @@
 #include <memory>//shared_ptr
 #include <list>//list
 #include <random>//mt19937
+#include <shared_mutex>
+#include <sstream>
 //----------------------------
 //Зона определений
 //----------------------------
@@ -17,42 +19,53 @@
 #define DELAY_MS 500
 //----------------------------
 using namespace std;
+using stm = shared_timed_mutex;
+
+//mutex для синхронизации вывода в cout
+static mutex scr_mx;
+
+static chrono::high_resolution_clock hclock;
 
 //Блокирующий контейнер
 class concurrent_data{
     int _data;
-    std::mutex _mx;
-    int writes=0;
-    int reads=0;
+    mutable stm _mx;
+
 public:
-    concurrent_data(int i=0):_data(i){
+    concurrent_data(int data=0):_data(data){
 
     }
     void set(int newData)
     {
-        std::lock_guard<mutex> lock(_mx);
+        unique_lock<stm> lock(_mx);
+        this_thread::sleep_for(chrono::milliseconds(1));
         _data = newData;
-        cout<<++writes<<":"<<this_thread::get_id()<<" Write: "<<_data<<endl;
     }
-    int read()
+    int read() const
     {
-        std::lock_guard<mutex> lock(_mx);
-        cout<<++reads<<":"<<this_thread::get_id()<<" Read: "<<_data<<endl;
+        shared_lock<stm> lock(_mx);
+        this_thread::sleep_for(chrono::milliseconds(1));
         return _data;
     }
 };
 //Задача чтения значения
 class reader_task{
     shared_ptr<concurrent_data> _data;
+
 public:
-    reader_task(concurrent_data *data):_data(data){
+    reader_task(shared_ptr<concurrent_data> data):_data(data){
+
     }
     void operator()(){
         for(int i=0;i<REPEATS;++i){
-            _data->read();
+            int result = _data->read();
+            auto end = hclock.now();
+            {
+            unique_lock<mutex> lock(scr_mx);
+            cout<<chrono::duration_cast<chrono::nanoseconds>(end.time_since_epoch()).count()<<" Iteration "<<i<<":Reader #"<<this_thread::get_id()<<" read "<<result<<endl;
+            }
             this_thread::sleep_for(chrono::milliseconds(DELAY_MS));
         }
-
     }
 };
 //Задача записи случайного значения
@@ -61,14 +74,20 @@ class writer_task{
     int _number;
     //random number generator
     mt19937 generator;
+
 public:
-    writer_task(concurrent_data *data):_data(data){
+    writer_task(shared_ptr<concurrent_data> data):_data(data){
         generator.seed(rand());
     }
     void operator()(){
         for(int i=0;i<REPEATS;++i){
             _number = generator()%25;
             _data->set(_number);
+            auto end = hclock.now();
+            {
+            unique_lock<mutex> lock(scr_mx);
+            cout<<chrono::duration_cast<chrono::nanoseconds>(end.time_since_epoch()).count()<<" Iteration "<<i<<":Writer #"<<this_thread::get_id()<<" wrote "<<_number<<endl;
+            }
             this_thread::sleep_for(chrono::milliseconds(DELAY_MS));
         }
     }
@@ -76,7 +95,7 @@ public:
 int main()
 {
     //Общий контейнер
-    auto data = new concurrent_data(22);
+    auto data = make_shared<concurrent_data>(22);
     //Заполняем список потоков
     list<unique_ptr<thread>> threads;
     for(int i=0;i<READERS;++i){
@@ -85,6 +104,7 @@ int main()
     for(int i=0;i<WRITERS;++i){
         threads.push_front(make_unique<thread>(writer_task(data)));
     }
+    data.reset();
     //Запускаем потоки
     for(auto &thread:threads){
         thread->join();
